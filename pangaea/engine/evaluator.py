@@ -91,7 +91,8 @@ class Evaluator:
 
     @staticmethod
     def sliding_inference(model, img, input_size, output_shape=None, stride=None, max_batch=None):
-        b, c, t, height, width = img[list(img.keys())[0]].shape
+        image_key = next(k for k in img if k != "gt")
+        b, c, t, height, width = img[image_key].shape
 
         if stride is None:
             h = int(math.ceil(height / input_size))
@@ -104,12 +105,25 @@ class Evaluator:
         w_grid = torch.linspace(0, width - input_size, w).round().long()
         num_crops_per_img = h * w
 
+        geotransform = img.pop("gt", None)
         for k, v in img.items():
             img_crops = []
             for i in range(h):
                 for j in range(w):
                     img_crops.append(v[:, :, :, h_grid[i]:h_grid[i] + input_size, w_grid[j]:w_grid[j] + input_size])
             img[k] = torch.cat(img_crops, dim=0)
+
+        if geotransform is not None:
+            gt_crops = []
+            for i in range(h):
+                for j in range(w):
+                    row = h_grid[i].to(geotransform)
+                    col = w_grid[j].to(geotransform)
+                    crop_gt = geotransform.clone()
+                    crop_gt[:, 0] += col * geotransform[:, 1] + row * geotransform[:, 2]
+                    crop_gt[:, 3] += col * geotransform[:, 4] + row * geotransform[:, 5]
+                    gt_crops.append(crop_gt)
+            img["gt"] = torch.cat(gt_crops, dim=0)
 
         pred = []
         max_batch = max_batch if max_batch is not None else b * num_crops_per_img
@@ -157,7 +171,9 @@ class LinearClassificationEvaluator(Evaluator):
         self, 
         model: torch.nn.Module, 
         model_name: str, 
-        model_ckpt_path: str | Path | None = None):
+        model_ckpt_path: str | Path | None = None,
+        save_outputs_dir: str | Path | None = None,
+        ):
         
         t = time.time()
         if model_ckpt_path is not None:
@@ -170,6 +186,10 @@ class LinearClassificationEvaluator(Evaluator):
             self.logger.info(f"Loaded {model_name} for evaluation")
         
         model.eval()
+
+        if save_outputs_dir is not None:
+            save_outputs_dir = Path(save_outputs_dir)
+            save_outputs_dir.mkdir(parents=True, exist_ok=True)
         
         all_preds = []
         all_targets = []
@@ -180,6 +200,11 @@ class LinearClassificationEvaluator(Evaluator):
         for batch_idx, data in enumerate(tqdm(self.val_loader, desc=tag)):
             image, target = data["image"], data["target"]
             image = {k: v.to(self.device) for k, v in image.items()}
+            metadata = data.get("metadata")
+            if metadata and all("gt" in item for item in metadata):
+                image["gt"] = torch.stack([item["gt"] for item in metadata]).to(
+                    self.device
+                )
             target = target.to(self.device)
             
             with torch.no_grad():
@@ -301,7 +326,8 @@ class KNNClassificationEvaluator(Evaluator):
         model: KNNClassifier,
         train_loader: DataLoader,
         model_name: str,
-        model_ckpt_path: str | Path | None = None
+        model_ckpt_path: str | Path | None = None,
+        save_outputs_dir: str | Path | None = None
     ):
         t0 = time.time()
         # Load checkpoint if provided
@@ -324,32 +350,112 @@ class KNNClassificationEvaluator(Evaluator):
         total = 0
         topk_correct = {k: 0.0 for k in model.topk}
 
-        for batch in tqdm(self.val_loader, desc="kNN-compute", leave=True):
+        for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="val", leave=True)):
             image, target = batch["image"], batch["target"]
             image = {k: v.to(self.device) for k, v in image.items()}
             target = target.to(self.device)
 
-            # one-hot encode val targets for multi-label
-            if self.multi_label and target.dim() == 1:
-                target = F.one_hot(target, num_classes=model.num_classes).float()
+            logits = model.classify(image)   # assuming shape [B, C]
 
-            pred = model.classify(image)
             bsz = target.size(0)
             total += bsz
 
             if self.multi_label:
-                # only compute a single F1 per batch
+                if target.dim() == 1:
+                    target = F.one_hot(target, num_classes=model.num_classes).float()
+
+                pred = (torch.sigmoid(logits) > 0.5).float()
+
                 f1 = sklearn.metrics.f1_score(
-                    target.cpu().numpy(),
-                    pred.cpu().numpy(),
-                    average='micro',
-                    zero_division=0
+                    target.detach().cpu().numpy(),
+                    pred.detach().cpu().numpy(),
+                    average="micro",
+                    zero_division=0,
                 )
-                topk_correct[ model.topk[0] ] += f1 * bsz
+                topk_correct[model.topk[0]] += f1 * bsz
+
             else:
+                pred = logits.argmax(dim=1)
+
                 for k in model.topk:
-                    acc = self.topk_acc(pred, target, k)
+                    acc = self.topk_acc(logits, target, k)
                     topk_correct[k] += acc * bsz
+
+            if save_outputs_dir is not None:
+                img = image["optical"].detach().cpu()
+                if img.ndim == 5 and img.shape[2] == 1:
+                    img = img[:, :, 0]
+
+                out = {
+                    "image": img.to(torch.float16),
+                    "logits": logits.detach().cpu(),
+                    "pred": pred.detach().cpu(),
+                    "target": target.detach().cpu(),
+                }
+
+                if "meta" in batch:
+                    out["meta"] = batch["meta"]
+                if "metadata" in batch:
+                    out["metadata"] = batch["metadata"]
+                if "id" in batch:
+                    out["id"] = batch["id"]
+                if "ids" in batch:
+                    out["ids"] = batch["ids"]
+
+                torch.save(out, save_outputs_dir / f"{self.split}_batch{batch_idx:06d}_rank{self.rank}.pt")
+        # for batch in tqdm(self.val_loader, desc="kNN-compute", leave=True):
+        #     image, target = batch["image"], batch["target"]
+        #     image = {k: v.to(self.device) for k, v in image.items()}
+        #     target = target.to(self.device)
+
+        #     # one-hot encode val targets for multi-label
+        #     if self.multi_label and target.dim() == 1:
+        #         target = F.one_hot(target, num_classes=model.num_classes).float()
+
+        #     pred = model.classify(image)
+        #     bsz = target.size(0)
+        #     total += bsz
+
+        #     if save_outputs_dir is not None:
+        #         # Save full-resolution outputs (before ignore masking), one file per batch per rank.
+        #         # Note: logits shape is (B, C, H, W). pred shape is (B, H, W). target is (B, H, W).
+        #         img = image["optical"].detach().cpu()
+
+        #         # optional: drop time dim if it exists and is 1
+        #         if img.ndim == 5 and img.shape[2] == 1:
+        #             img = img[:, :, 0]  # (B,C,H,W)
+
+        #         out = {
+        #             "image": img.to(torch.float16),
+        #             "pred": pred.detach().cpu(),
+        #             "target": target.detach().cpu(),
+        #         }
+
+        #         # If your dataset provides identifiers, save them too (best-effort)
+        #         if "meta" in data:
+        #             out["meta"] = data["meta"]
+        #         if "metadata" in data:
+        #             out["metadata"] = data["metadata"]
+        #         if "id" in data:
+        #             out["id"] = data["id"]
+        #         if "ids" in data:
+        #             out["ids"] = data["ids"]
+
+        #         torch.save(out, save_outputs_dir / f"{self.split}_batch{batch_idx:06d}_rank{self.rank}.pt")
+
+        #     if self.multi_label:
+        #         # only compute a single F1 per batch
+        #         f1 = sklearn.metrics.f1_score(
+        #             target.cpu().numpy(),
+        #             pred.cpu().numpy(),
+        #             average='micro',
+        #             zero_division=0
+        #         )
+        #         topk_correct[ model.topk[0] ] += f1 * bsz
+        #     else:
+        #         for k in model.topk:
+        #             acc = self.topk_acc(pred, target, k)
+        #             topk_correct[k] += acc * bsz
 
         # Aggregate metrics
         if self.multi_label:
@@ -412,7 +518,7 @@ class SegEvaluator(Evaluator):
         super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb)
 
     @torch.no_grad()
-    def evaluate(self, model, model_name='model', model_ckpt_path=None):
+    def evaluate(self, model, model_name='model', model_ckpt_path=None, save_outputs_dir: str | Path | None = None):
         t = time.time()
 
         if model_ckpt_path is not None:
@@ -426,6 +532,10 @@ class SegEvaluator(Evaluator):
             self.logger.info(f"Loaded {model_name} for evaluation")
         model.eval()
 
+        if save_outputs_dir is not None:
+            save_outputs_dir = Path(save_outputs_dir)
+            save_outputs_dir.mkdir(parents=True, exist_ok=True)
+
         tag = f"Evaluating {model_name} on {self.split} set"
         confusion_matrix = torch.zeros(
             (self.num_classes, self.num_classes), device=self.device
@@ -435,6 +545,11 @@ class SegEvaluator(Evaluator):
 
             image, target = data["image"], data["target"]
             image = {k: v.to(self.device) for k, v in image.items()}
+            metadata = data.get("metadata")
+            if metadata and all("gt" in item for item in metadata):
+                image["gt"] = torch.stack([item["gt"] for item in metadata]).to(
+                    self.device
+                )
             target = target.to(self.device)
 
             if self.inference_mode == "sliding":
@@ -449,12 +564,41 @@ class SegEvaluator(Evaluator):
                 pred = (torch.sigmoid(logits) > 0.5).type(torch.int64).squeeze(dim=1)
             else:
                 pred = torch.argmax(logits, dim=1)
+
+            if save_outputs_dir is not None:
+                # Save full-resolution outputs (before ignore masking), one file per batch per rank.
+                # Note: logits shape is (B, C, H, W). pred shape is (B, H, W). target is (B, H, W).
+                img = image["optical"].detach().cpu()
+
+                # optional: drop time dim if it exists and is 1
+                if img.ndim == 5 and img.shape[2] == 1:
+                    img = img[:, :, 0]  # (B,C,H,W)
+
+                out = {
+                    "image": img.to(torch.float16),
+                    "pred": pred.detach().cpu(),
+                    "target": target.detach().cpu(),
+                }
+
+                # If your dataset provides identifiers, save them too (best-effort)
+                if "meta" in data:
+                    out["meta"] = data["meta"]
+                if "metadata" in data:
+                    out["metadata"] = data["metadata"]
+                if "id" in data:
+                    out["id"] = data["id"]
+                if "ids" in data:
+                    out["ids"] = data["ids"]
+
+                torch.save(out, save_outputs_dir / f"{self.split}_batch{batch_idx:06d}_rank{self.rank}.pt")
+
             valid_mask = target != self.ignore_index
             pred, target = pred[valid_mask], target[valid_mask]
             count = torch.bincount(
                 (pred * self.num_classes + target), minlength=self.num_classes ** 2
             )
             confusion_matrix += count.view(self.num_classes, self.num_classes)
+            
 
         torch.distributed.all_reduce(
             confusion_matrix, op=torch.distributed.ReduceOp.SUM
@@ -598,7 +742,7 @@ class RegEvaluator(Evaluator):
         super().__init__(val_loader, exp_dir, device, inference_mode, sliding_inference_batch, use_wandb)
 
     @torch.no_grad()
-    def evaluate(self, model, model_name='model', model_ckpt_path=None):
+    def evaluate(self, model, model_name='model', model_ckpt_path=None, save_outputs_dir: str | Path | None = None):
         t = time.time()
 
         if model_ckpt_path is not None:
@@ -613,6 +757,10 @@ class RegEvaluator(Evaluator):
 
         model.eval()
 
+        if save_outputs_dir is not None:
+            save_outputs_dir = Path(save_outputs_dir)
+            save_outputs_dir.mkdir(parents=True, exist_ok=True)
+
         tag = f'Evaluating {model_name} on {self.split} set'
 
         mse = torch.zeros(1, device=self.device)
@@ -620,6 +768,11 @@ class RegEvaluator(Evaluator):
         for batch_idx, data in enumerate(tqdm(self.val_loader, desc=tag)):
             image, target = data['image'], data['target']
             image = {k: v.to(self.device) for k, v in image.items()}
+            metadata = data.get("metadata")
+            if metadata and all("gt" in item for item in metadata):
+                image["gt"] = torch.stack([item["gt"] for item in metadata]).to(
+                    self.device
+                )
             target = target.to(self.device)
 
             if self.inference_mode == "sliding":
@@ -632,6 +785,33 @@ class RegEvaluator(Evaluator):
                 raise NotImplementedError((f"Inference mode {self.inference_mode} is not implemented."))
 
             mse += F.mse_loss(logits, target)
+
+            if save_outputs_dir is not None:
+                # Save full-resolution outputs (before ignore masking), one file per batch per rank.
+                # Note: logits shape is (B, C, H, W). pred shape is (B, H, W). target is (B, H, W).
+                img = image["optical"].detach().cpu()
+
+                # optional: drop time dim if it exists and is 1
+                if img.ndim == 5 and img.shape[2] == 1:
+                    img = img[:, :, 0]  # (B,C,H,W)
+
+                out = {
+                    "image": img.to(torch.float16),
+                    "pred": logits.detach().cpu(),
+                    "target": target.detach().cpu(),
+                }
+
+                # If your dataset provides identifiers, save them too (best-effort)
+                if "meta" in data:
+                    out["meta"] = data["meta"]
+                if "metadata" in data:
+                    out["metadata"] = data["metadata"]
+                if "id" in data:
+                    out["id"] = data["id"]
+                if "ids" in data:
+                    out["ids"] = data["ids"]
+
+                torch.save(out, save_outputs_dir / f"{self.split}_batch{batch_idx:06d}_rank{self.rank}.pt")
 
         torch.distributed.all_reduce(mse, op=torch.distributed.ReduceOp.SUM)
         mse = mse / len(self.val_loader)

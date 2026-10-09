@@ -133,6 +133,11 @@ class Trainer:
         for batch_idx, data in enumerate(self.train_loader):
             image, target = data["image"], data["target"]
             image = {modality: value.to(self.device) for modality, value in image.items()}
+            metadata = data.get("metadata")
+            if metadata and all("gt" in item for item in metadata):
+                image["gt"] = torch.stack([item["gt"] for item in metadata]).to(
+                    self.device
+                )
             target = target.to(self.device)
 
             self.training_stats["data_time"].update(time.time() - end_time)
@@ -145,7 +150,48 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            if not torch.isfinite(loss):
+            ## 
+            # if not torch.isfinite(loss):
+            #     raise FloatingPointError(
+            #         f"Rank {self.rank} got infinite/NaN loss at batch {batch_idx} of epoch {epoch}!"
+            #     )
+
+            ## DDP-safe non-finite loss policy
+            loss_nonfinite_local = int(not torch.isfinite(loss).item())
+
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                t = torch.tensor([loss_nonfinite_local], device=loss.device, dtype=torch.int32)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+                loss_nonfinite_global = int(t.item())
+            else:
+                loss_nonfinite_global = loss_nonfinite_local
+
+            if loss_nonfinite_global:
+                # Make sure we don't carry grads from anything weird
+                self.optimizer.zero_grad(set_to_none=True)
+
+                # AMP scaler: update so it can recover (optional but usually safe)
+                # If you'd rather *not* touch scaler on skipped steps, you can remove this line.
+                self.scaler.update()
+
+                # Pick one behavior:
+                nan_policy = "skip_batch" # "skip_batch" | "stop_epoch" | "raise"
+
+                if self.rank == 0:
+                    self.logger.warning(
+                        f"Non-finite loss detected at batch {batch_idx} of epoch {epoch}. "
+                        f"Policy={nan_policy} (local_nonfinite={loss_nonfinite_local})."
+                    )
+
+                if nan_policy == "skip_batch":
+                    # Skip this batch, continue training
+                    continue
+
+                if nan_policy == "stop_epoch":
+                    # Stop epoch early ("skip such epoch" remainder)
+                    break
+
+                # default: crash as before
                 raise FloatingPointError(
                     f"Rank {self.rank} got infinite/NaN loss at batch {batch_idx} of epoch {epoch}!"
                 )

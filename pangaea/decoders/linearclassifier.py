@@ -100,9 +100,9 @@ class LinearClassifier(Decoder):
             # [B C T=1 H W] -> [B C H W]
             if not self.finetune:
                 with torch.no_grad():
-                    feat = self.encoder({k: v[:, :, 0, :, :] for k, v in img.items()})
+                    feat = self.encoder({k: v if k == "gt" else v[:, :, 0, :, :] for k, v in img.items()})
             else:
-                feat = self.encoder({k: v[:, :, 0, :, :] for k, v in img.items()})
+                feat = self.encoder({k: v if k == "gt" else v[:, :, 0, :, :] for k, v in img.items()})
 
         shapes = torch.tensor([f.shape[2:] for f in feat])  # Extract H, W for each tensor
         max_h, max_w = shapes.max(dim=0).values

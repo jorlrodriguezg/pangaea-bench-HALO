@@ -262,7 +262,6 @@ def main(cfg: DictConfig) -> None:
 
         trainer.train()
 
-    
     # Evaluation
     test_preprocessor = instantiate(
         cfg.preprocessing.test,
@@ -294,10 +293,23 @@ def main(cfg: DictConfig) -> None:
     else:
         model_ckpt_path = get_best_model_ckpt_path(exp_dir)
         
-    if model_ckpt_path is None and not cfg.task.trainer.model_name == "knn_probe":
-        raise ValueError(f"No model checkpoint found in {exp_dir}")
+    # if model_ckpt_path is None and not cfg.task.trainer.model_name == "knn_probe":
+    #     raise ValueError(f"No model checkpoint found in {exp_dir}")
     
-    test_evaluator.evaluate(decoder, "test_model", model_ckpt_path)
+    # test_evaluator.evaluate(decoder, "test_model", model_ckpt_path)
+
+    # --- NEW: test outputs ---
+    if model_ckpt_path is None and not cfg.task.trainer.model_name == "knn_probe":
+        raise ValueError(f"No best model checkpoint found in {exp_dir}")
+
+    # This re-runs val once (same evaluator), but saves outputs to disk
+    test_dump_dir = exp_dir / "val_outputs_best"
+    test_evaluator.evaluate(
+        decoder,
+        model_name="best_test_dump",
+        model_ckpt_path=model_ckpt_path,
+        save_outputs_dir=test_dump_dir,   # <--- NEW KWARG (we add it in evaluator)
+    )
 
     if cfg.use_wandb and rank == 0:
         wandb.finish()

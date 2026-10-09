@@ -224,13 +224,18 @@ class SegUPerNet(Decoder):
                 feat = [f.squeeze(-3) for f in feat]
 
         else:
-            # remove the temporal dim
+            # Remove the temporal dimension from image modalities, but preserve
+            # the [B, 6] geotransform tensor.
             # [B C T=1 H W] -> [B C H W]
+            encoder_input = {
+                k: v if k == "gt" else v[:, :, 0, :, :]
+                for k, v in img.items()
+            }
             if not self.finetune:
                 with torch.no_grad():
-                    feat = self.encoder({k: v[:, :, 0, :, :] for k, v in img.items()})
+                    feat = self.encoder(encoder_input)
             else:
-                feat = self.encoder({k: v[:, :, 0, :, :] for k, v in img.items()})
+                feat = self.encoder(encoder_input)
 
         feat = self.neck(feat)
         feat = self._forward_feature(feat)
@@ -662,11 +667,25 @@ class RegUPerNet(Decoder):
         return feats
 
     def forward(self, img, output_shape=None):
-        if not self.finetune:
-            with torch.no_grad():
+        # img[modality] has shape [B C T H W]
+        if self.encoder.multi_temporal:
+            if not self.finetune:
+                with torch.no_grad():
+                    feat = self.encoder(img)
+            else:
                 feat = self.encoder(img)
+
+            # multi_temporal models can return either (B C' T=1 H' W')
+            # or (B C' H' W'), we need (B C' H' W')
+            if self.encoder.multi_temporal_output:
+                feat = [f.squeeze(-3) for f in feat]
         else:
-            feat = self.encoder(img)
+            # remove temporal dim: [B C T=1 H W] -> [B C H W]
+            if not self.finetune:
+                with torch.no_grad():
+                    feat = self.encoder({k: v if k == "gt" else v[:, :, 0, :, :] for k, v in img.items()})
+            else:
+                feat = self.encoder({k: v if k == "gt" else v[:, :, 0, :, :] for k, v in img.items()})
 
         feat = self.neck(feat)
         feat = self._forward_feature(feat)
